@@ -84,7 +84,8 @@ fn parse_yaml(content: &str) -> Result<Value, ParseError> {
 }
 
 fn parse_toml(content: &str) -> Result<Value, ParseError> {
-    let value: toml::Value = toml::from_str(content).map_err(|e| ParseError::Toml(e.to_string()))?;
+    let value: toml::Value =
+        toml::from_str(content).map_err(|e| ParseError::Toml(e.to_string()))?;
     toml_to_json(&value)
 }
 
@@ -92,9 +93,7 @@ fn parse_toml(content: &str) -> Result<Value, ParseError> {
 fn toml_to_json(value: &toml::Value) -> Result<Value, ParseError> {
     match value {
         toml::Value::String(s) => Ok(Value::String(s.clone())),
-        toml::Value::Integer(i) => Ok(Value::Number(
-            serde_json::Number::from(*i),
-        )),
+        toml::Value::Integer(i) => Ok(Value::Number(serde_json::Number::from(*i))),
         toml::Value::Float(f) => {
             let n = serde_json::Number::from_f64(*f)
                 .ok_or_else(|| ParseError::Toml(format!("Invalid float: {}", f)))?;
@@ -212,7 +211,10 @@ mod tests {
     #[test]
     fn test_detect_json() {
         assert_eq!(Format::from_extension("data.json"), Some(Format::Json));
-        assert_eq!(Format::from_extension("path/to/file.JSON"), Some(Format::Json));
+        assert_eq!(
+            Format::from_extension("path/to/file.JSON"),
+            Some(Format::Json)
+        );
     }
 
     #[test]

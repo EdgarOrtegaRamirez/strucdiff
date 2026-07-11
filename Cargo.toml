@@ -1,6 +1,6 @@
 [package]
 name = "strucdiff"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Semantic structured data diff CLI — compare JSON, YAML, TOML, and CSV files structurally"
 authors = ["EdgarOrtegaRamirez"]

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-StrucDiff is a Rust CLI tool that semantically diffs structured data files (JSON, YAML, TOML, CSV). Unlike `diff`, it parses each format into `serde_json::Value` and compares at the structural level.
+StrucDiff is a Rust CLI tool that semantically diffs structured data files (JSON, YAML, TOML, CSV). Unlike `diff`, it parses each format into `serde_json::Value` and compares at the structural level. It also features rename detection and schema inference.
 
 ## Project Structure
 
@@ -10,11 +10,11 @@ StrucDiff is a Rust CLI tool that semantically diffs structured data files (JSON
 strucdiff/
 ├── Cargo.toml          # Rust project config (clap, serde_json, serde_yaml, toml, csv, colored, walkdir)
 ├── src/
-│   ├── main.rs         # CLI entry point with clap Subcommand (Diff, Dir)
-│   ├── diff.rs         # Core diff engine — recursive value comparison, DiffResult/DiffEntry types
+│   ├── main.rs         # CLI entry point with clap Subcommand (Diff, Dir, Schema)
+│   ├── diff.rs         # Core diff engine — recursive value comparison, rename detection, Levenshtein
 │   ├── format.rs       # Format parsers — JSON, YAML, TOML, CSV → serde_json::Value
-│   └── output.rs       # Output renderers — Text (colorized terminal) and JSON
-├── tests/              # Integration tests (future)
+│   ├── output.rs       # Output renderers — Text (colorized) and JSON, handles Renamed entries
+│   └── schema.rs       # Schema inference — type detection, JSON Schema (Draft 2020-12) generation
 ├── .github/workflows/ci.yml  # CI build + test pipeline
 ├── README.md           # Full documentation
 ├── LICENSE             # MIT
@@ -27,7 +27,7 @@ strucdiff/
 ```bash
 cargo build              # Debug build
 cargo build --release    # Release build
-cargo test               # Run all tests (unit tests in doc modules)
+cargo test               # Run all tests (67 tests)
 cargo clippy             # Lint
 cargo fmt                # Format code
 ```
@@ -48,9 +48,25 @@ cargo fmt                # Format code
 
 1. **Unified representation**: All formats are parsed into `serde_json::Value`. This allows a single diff engine regardless of input format.
 2. **Path-based diffs**: Changes are reported as dot-notation paths (e.g., `app.config.host`). Arrays use bracket notation (`items[0].name`).
-3. **Format detection**: By file extension (.json, .yaml, .yml, .toml, .csv). Override with `--type`.
-4. **Output separation**: Output rendering is decoupled from diff logic. Adding new output formats (e.g., HTML, YAML) only requires a new renderer.
-5. **TOML conversion**: TOML's type system (datetimes, inline tables) is converted to serde_json::Value in `parse_toml()`.
+3. **Format detection**: By file extension (.json, .yaml, .yml, .toml, .csv). Override with `--type`. Stdin defaults to JSON.
+4. **Output separation**: Output rendering is decoupled from diff logic. Adding new output formats only requires a new renderer.
+5. **Rename detection**: When comparing objects, keys only-in-left are matched to keys only-in-right by Levenshtein similarity (threshold 0.6). Keys are normalized (lowercase, separator unification) before comparison. Disable with `--no-rename`.
+6. **Schema inference**: The `schema` subcommand walks a value tree and infers types (integer, number, string, boolean, null, object, array), required fields, nested object schemas, and array item types. Outputs as text tree, JSON tree, or JSON Schema (Draft 2020-12).
+
+## Key Algorithms
+
+### Rename Detection
+- `find_renames()` — matches keys-only-in-left to keys-only-in-right by similarity
+- `key_similarity()` — normalizes keys (lowercase, unify separators -/_/./space to dash), then computes `1.0 - levenshtein/max_len`
+- `levenshtein()` — standard edit distance with two-row DP for space efficiency
+- Threshold: 0.6 (configurable via `DiffConfig.rename_threshold`)
+
+### Schema Inference
+- `infer_schema()` — recursively walks `serde_json::Value`, producing `SchemaNode` tree
+- `merge_schemas()` — merges schemas from array items (for heterogeneous arrays)
+- `to_json_schema()` — converts `SchemaNode` to JSON Schema (Draft 2020-12) `serde_json::Value`
+- `render_text()` — human-readable tree view
+- `render_json_tree()` — JSON tree representation
 
 ## Adding a New Format
 

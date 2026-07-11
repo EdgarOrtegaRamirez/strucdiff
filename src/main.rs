@@ -1,6 +1,7 @@
 mod diff;
 mod format;
 mod output;
+mod schema;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -9,12 +10,18 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::diff::diff_values;
+use crate::diff::{diff_values_with_config, DiffConfig};
 use crate::format::{parse_content, Format};
 use crate::output::{render_diff, OutputFormat};
+use crate::schema::{infer_schema, render_json_tree, render_text, to_json_schema};
 
 #[derive(Parser)]
-#[command(name = "strucdiff", about = "Semantic structured data diff tool", version, long_version = None)]
+#[command(
+    name = "strucdiff",
+    about = "Semantic structured data diff tool — compare JSON, YAML, TOML, CSV structurally",
+    version,
+    long_version = None
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -40,6 +47,10 @@ enum Commands {
         /// Input format (auto-detect by default)
         #[arg(long, short = 't', value_parser = ["json", "yaml", "toml", "csv"])]
         r#type: Option<String>,
+
+        /// Disable rename detection (by default, renamed keys are detected)
+        #[arg(long = "no-rename")]
+        no_rename: bool,
     },
     /// Compare all supported files in two directories
     Dir {
@@ -50,6 +61,19 @@ enum Commands {
         /// Output format: text (default) or json
         #[arg(long, short = 'f', default_value = "text", value_parser = ["text", "json"])]
         format: String,
+    },
+    /// Infer and display the schema of a structured data file
+    Schema {
+        /// Input file (use - for stdin)
+        file: String,
+
+        /// Output format: text (default), json (tree view), or schema (JSON Schema Draft 2020-12)
+        #[arg(long, short = 'f', default_value = "text", value_parser = ["text", "json", "schema"])]
+        format: String,
+
+        /// Input format (auto-detect by default)
+        #[arg(long, short = 't', value_parser = ["json", "yaml", "toml", "csv"])]
+        r#type: Option<String>,
     },
 }
 
@@ -63,8 +87,14 @@ fn main() {
             format,
             ignore,
             r#type,
-        } => handle_diff(file1, file2, format, ignore, r#type),
+            no_rename,
+        } => handle_diff(file1, file2, format, ignore, r#type, *no_rename),
         Commands::Dir { dir1, dir2, format } => handle_dir(dir1, dir2, format),
+        Commands::Schema {
+            file,
+            format,
+            r#type,
+        } => handle_schema(file, format, r#type),
     };
 
     if let Err(e) = result {
@@ -79,6 +109,7 @@ fn handle_diff(
     format_str: &str,
     ignore_paths: &[String],
     force_type: &Option<String>,
+    no_rename: bool,
 ) -> Result<(), String> {
     let output_format = match format_str {
         "json" => OutputFormat::Json,
@@ -113,10 +144,7 @@ fn handle_diff(
                 if f1 != f2 {
                     return Err(format!(
                         "File format mismatch: {} is {} but {} is {}",
-                        file1,
-                        f1,
-                        file2,
-                        f2
+                        file1, f1, file2, f2
                     ));
                 }
             }
@@ -130,14 +158,19 @@ fn handle_diff(
     let val1 = parse_content(&content1, fmt).map_err(|e| e.to_string())?;
     let val2 = parse_content(&content2, fmt).map_err(|e| e.to_string())?;
 
-    let mut result = diff_values(&val1, &val2, "");
+    let config = DiffConfig {
+        rename_detection: !no_rename,
+        rename_threshold: 0.6,
+    };
+
+    let mut result = diff_values_with_config(&val1, &val2, "", &config);
 
     // Apply ignore filters
     if !ignore_paths.is_empty() {
         result.entries.retain(|e| {
-            !ignore_paths.iter().any(|ignored| {
-                e.path == *ignored || e.path.starts_with(&format!("{}.", ignored))
-            })
+            !ignore_paths
+                .iter()
+                .any(|ignored| e.path == *ignored || e.path.starts_with(&format!("{}.", ignored)))
         });
         result.identical = result.entries.is_empty();
     }
@@ -155,7 +188,7 @@ fn handle_diff(
 }
 
 fn handle_dir(dir1: &str, dir2: &str, format_str: &str) -> Result<(), String> {
-    let output_format = match format_str {
+    let _output_format = match format_str {
         "json" => OutputFormat::Json,
         _ => OutputFormat::Text,
     };
@@ -174,7 +207,9 @@ fn handle_dir(dir1: &str, dir2: &str, format_str: &str) -> Result<(), String> {
     let mut had_diffs = false;
 
     // Walk dir1, find matching files in dir2
-    let walker = WalkDir::new(dir1_path).follow_links(true).into_iter()
+    let walker = WalkDir::new(dir1_path)
+        .follow_links(true)
+        .into_iter()
         .filter_entry(|e| {
             !e.file_name()
                 .to_str()
@@ -238,7 +273,8 @@ fn handle_dir(dir1: &str, dir2: &str, format_str: &str) -> Result<(), String> {
         let val1 = parse_content(&content1, fmt).map_err(|e| e.to_string())?;
         let val2 = parse_content(&content2, fmt).map_err(|e| e.to_string())?;
 
-        let result = diff_values(&val1, &val2, "");
+        let config = DiffConfig::default();
+        let result = diff_values_with_config(&val1, &val2, "", &config);
 
         let count = result.entries.len();
         if !result.identical {
@@ -253,19 +289,16 @@ fn handle_dir(dir1: &str, dir2: &str, format_str: &str) -> Result<(), String> {
             had_diffs = true;
             results.push((rel_str.to_string(), false, count));
         } else {
-            writeln!(
-                io::stdout(),
-                "  {} {}",
-                "✓".green(),
-                rel_str
-            )
-            .map_err(|e| format!("Output error: {}", e))?;
+            writeln!(io::stdout(), "  {} {}", "✓".green(), rel_str)
+                .map_err(|e| format!("Output error: {}", e))?;
             results.push((rel_str.to_string(), true, 0));
         }
     }
 
     // Check for files in dir2 not in dir1
-    let walker2 = WalkDir::new(dir2_path).follow_links(true).into_iter()
+    let walker2 = WalkDir::new(dir2_path)
+        .follow_links(true)
+        .into_iter()
         .filter_entry(|e| {
             !e.file_name()
                 .to_str()
@@ -306,12 +339,69 @@ fn handle_dir(dir1: &str, dir2: &str, format_str: &str) -> Result<(), String> {
     }
 
     if !had_diffs {
-        writeln!(io::stdout(), "{}", "✓ Directories are identical".green().bold())
-            .map_err(|e| format!("Output error: {}", e))?;
+        writeln!(
+            io::stdout(),
+            "{}",
+            "✓ Directories are identical".green().bold()
+        )
+        .map_err(|e| format!("Output error: {}", e))?;
     }
 
     if had_diffs {
         std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn handle_schema(file: &str, format_str: &str, force_type: &Option<String>) -> Result<(), String> {
+    let fmt = if let Some(ft) = force_type {
+        match ft.as_str() {
+            "json" => Format::Json,
+            "yaml" => Format::Yaml,
+            "toml" => Format::Toml,
+            "csv" => Format::Csv,
+            _ => {
+                return Err(format!(
+                    "Unknown format: {}. Supported: json, yaml, toml, csv",
+                    ft
+                ));
+            }
+        }
+    } else if file == "-" {
+        // Default to JSON for stdin
+        Format::Json
+    } else {
+        Format::from_extension(file).ok_or_else(|| {
+            format!(
+                "Cannot detect format from file extension. Supported formats: {}",
+                Format::extensions().join(", ")
+            )
+        })?
+    };
+
+    let content = read_file(file)?;
+    let val = parse_content(&content, fmt).map_err(|e| e.to_string())?;
+
+    let node = infer_schema(&val, "$");
+
+    let mut stdout = io::stdout();
+    match format_str {
+        "json" => {
+            let tree = render_json_tree(&node);
+            writeln!(stdout, "{}", serde_json::to_string_pretty(&tree).unwrap())
+                .map_err(|e| format!("Output error: {}", e))?;
+        }
+        "schema" => {
+            let schema = to_json_schema(&node);
+            writeln!(stdout, "{}", serde_json::to_string_pretty(&schema).unwrap())
+                .map_err(|e| format!("Output error: {}", e))?;
+        }
+        _ => {
+            // Text format
+            let text = render_text(&node, 0);
+            write!(stdout, "{}", text).map_err(|e| format!("Output error: {}", e))?;
+        }
     }
 
     Ok(())
@@ -334,13 +424,6 @@ fn read_file(path: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    #[test]
-    fn test_read_file_stdin() {
-        // Can't easily test stdin, just verify - triggers stdin path
-        // This is covered by integration tests
-    }
 
     #[test]
     fn test_read_file_nonexistent() {
@@ -350,14 +433,8 @@ mod tests {
 
     #[test]
     fn test_detect_format_by_extension() {
-        assert_eq!(
-            Format::from_extension("config.yaml"),
-            Some(Format::Yaml)
-        );
-        assert_eq!(
-            Format::from_extension("data.json"),
-            Some(Format::Json)
-        );
+        assert_eq!(Format::from_extension("config.yaml"), Some(Format::Yaml));
+        assert_eq!(Format::from_extension("data.json"), Some(Format::Json));
         assert_eq!(Format::from_extension("file.txt"), None);
     }
 
