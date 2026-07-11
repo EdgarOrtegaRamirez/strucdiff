@@ -9,6 +9,8 @@ pub enum OutputFormat {
     Text,
     /// JSON output for CI/automation
     Json,
+    /// Compact summary output (add/remove/modify counts + field-level CSV diffs)
+    Summary,
 }
 
 /// Render diff results to the given writer
@@ -22,6 +24,7 @@ pub fn render_diff(
     match format {
         OutputFormat::Text => render_text(result, file1, file2, writer),
         OutputFormat::Json => render_json(result, file1, file2, writer),
+        OutputFormat::Summary => render_summary(result, file1, file2, writer),
     }
 }
 
@@ -98,11 +101,24 @@ fn render_text(
                 }
             }
             DiffKind::Changed => {
-                if let Some(ref old) = entry.old_value {
-                    writeln!(writer, "      {} {}", "-".red(), old.red())?;
-                }
-                if let Some(ref new) = entry.new_value {
-                    writeln!(writer, "      {} {}", "+".green(), new.green())?;
+                if let Some(ref changes) = entry.field_changes {
+                    writeln!(writer, "      ~ modified ({} field(s))", changes.len())?;
+                    for fc in changes {
+                        writeln!(
+                            writer,
+                            "          {}: \"{}\" -> \"{}\"",
+                            fc.column.yellow(),
+                            fc.old_value.red(),
+                            fc.new_value.green()
+                        )?;
+                    }
+                } else {
+                    if let Some(ref old) = entry.old_value {
+                        writeln!(writer, "      {} {}", "-".red(), old.red())?;
+                    }
+                    if let Some(ref new) = entry.new_value {
+                        writeln!(writer, "      {} {}", "+".green(), new.green())?;
+                    }
                 }
             }
             DiffKind::Renamed => {
@@ -168,6 +184,40 @@ fn render_json(
                 serde_json::Value::String(new_key.clone()),
             );
         }
+        if let Some(ref row_key) = entry.row_key {
+            obj.insert(
+                "row_key".to_string(),
+                serde_json::Value::String(row_key.clone()),
+            );
+        }
+        if let Some(ref field_changes) = entry.field_changes {
+            let fc_json: Vec<serde_json::Value> = field_changes
+                .iter()
+                .map(|fc| {
+                    serde_json::json!({
+                        "column": fc.column,
+                        "old_value": fc.old_value,
+                        "new_value": fc.new_value,
+                    })
+                })
+                .collect();
+            obj.insert(
+                "field_changes".to_string(),
+                serde_json::Value::Array(fc_json),
+            );
+        }
+        if let Some(row_idx) = entry.row_index_old {
+            obj.insert(
+                "row_index_old".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(row_idx as u64)),
+            );
+        }
+        if let Some(row_idx) = entry.row_index_new {
+            obj.insert(
+                "row_index_new".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(row_idx as u64)),
+            );
+        }
         entries_json.push(serde_json::Value::Object(obj));
     }
 
@@ -183,10 +233,93 @@ fn render_json(
     Ok(())
 }
 
+fn render_summary(
+    result: &DiffResult,
+    file1: &str,
+    file2: &str,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    if result.identical {
+        writeln!(writer, "✓ Files are identical")?;
+        return Ok(());
+    }
+
+    let mut added = 0;
+    let mut removed = 0;
+    let mut changed = 0;
+    let mut renamed = 0;
+
+    for entry in &result.entries {
+        match entry.kind {
+            DiffKind::Added => added += 1,
+            DiffKind::Removed => removed += 1,
+            DiffKind::Changed => changed += 1,
+            DiffKind::Renamed => renamed += 1,
+        }
+    }
+
+    writeln!(writer, "─── Summary ───")?;
+    writeln!(writer, "  Old: {}", file1)?;
+    writeln!(writer, "  New: {}", file2)?;
+    writeln!(writer, "  Total changes: {}", result.entries.len())?;
+    if added > 0 {
+        writeln!(writer, "  + Added:      {}", added)?;
+    }
+    if removed > 0 {
+        writeln!(writer, "  - Removed:    {}", removed)?;
+    }
+    if changed > 0 {
+        writeln!(writer, "  ~ Modified:   {}", changed)?;
+    }
+    if renamed > 0 {
+        writeln!(writer, "  → Renamed:    {}", renamed)?;
+    }
+    writeln!(writer)?;
+
+    // Show CSV row-level diffs if field_changes or row_key is present
+    for entry in &result.entries {
+        if let Some(ref key) = entry.row_key {
+            match entry.kind {
+                DiffKind::Added => {
+                    writeln!(writer, "  + [{}] added", key)?;
+                    if let Some(ref value) = entry.new_value {
+                        for line in value.lines() {
+                            writeln!(writer, "      {}", line)?;
+                        }
+                    }
+                }
+                DiffKind::Removed => {
+                    writeln!(writer, "  - [{}] removed", key)?;
+                    if let Some(ref value) = entry.old_value {
+                        for line in value.lines() {
+                            writeln!(writer, "      {}", line)?;
+                        }
+                    }
+                }
+                DiffKind::Changed => {
+                    writeln!(writer, "  ~ [{}] modified", key)?;
+                    if let Some(ref changes) = entry.field_changes {
+                        for fc in changes {
+                            writeln!(
+                                writer,
+                                "      {}: \"{}\" → \"{}\"",
+                                fc.column, fc.old_value, fc.new_value
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{DiffEntry, DiffKind, DiffResult};
+    use crate::diff::{DiffEntry, DiffKind, DiffResult, FieldChange};
 
     fn make_result() -> DiffResult {
         DiffResult {
@@ -199,6 +332,10 @@ mod tests {
                     new_value: Some("prod.example.com".to_string()),
                     old_key: None,
                     new_key: None,
+                    field_changes: None,
+                    row_key: None,
+                    row_index_old: None,
+                    row_index_new: None,
                 },
                 DiffEntry {
                     path: "config.port".to_string(),
@@ -207,6 +344,10 @@ mod tests {
                     new_value: Some("443".to_string()),
                     old_key: None,
                     new_key: None,
+                    field_changes: None,
+                    row_key: None,
+                    row_index_old: None,
+                    row_index_new: None,
                 },
                 DiffEntry {
                     path: "features.new_feature".to_string(),
@@ -215,6 +356,10 @@ mod tests {
                     new_value: Some("true".to_string()),
                     old_key: None,
                     new_key: None,
+                    field_changes: None,
+                    row_key: None,
+                    row_index_old: None,
+                    row_index_new: None,
                 },
                 DiffEntry {
                     path: "old_config".to_string(),
@@ -223,6 +368,10 @@ mod tests {
                     new_value: None,
                     old_key: None,
                     new_key: None,
+                    field_changes: None,
+                    row_key: None,
+                    row_index_old: None,
+                    row_index_new: None,
                 },
             ],
         }
@@ -238,6 +387,10 @@ mod tests {
                 new_value: Some("\"alice\"".to_string()),
                 old_key: Some("userName".to_string()),
                 new_key: Some("username".to_string()),
+                field_changes: None,
+                row_key: None,
+                row_index_old: None,
+                row_index_new: None,
             }],
         }
     }
@@ -316,5 +469,144 @@ mod tests {
         assert_eq!(entry["kind"], "renamed");
         assert_eq!(entry["old_key"], "userName");
         assert_eq!(entry["new_key"], "username");
+    }
+
+    #[test]
+    fn test_render_text_csv_field_changes() {
+        let result = DiffResult {
+            identical: false,
+            entries: vec![DiffEntry {
+                path: "[1]".to_string(),
+                kind: DiffKind::Changed,
+                old_value: Some("Alice, 30, NYC".to_string()),
+                new_value: Some("Alice, 31, Boston".to_string()),
+                old_key: None,
+                new_key: None,
+                field_changes: Some(vec![
+                    FieldChange {
+                        column: "age".to_string(),
+                        old_value: "30".to_string(),
+                        new_value: "31".to_string(),
+                    },
+                    FieldChange {
+                        column: "city".to_string(),
+                        old_value: "NYC".to_string(),
+                        new_value: "Boston".to_string(),
+                    },
+                ]),
+                row_key: Some("1".to_string()),
+                row_index_old: Some(0),
+                row_index_new: Some(0),
+            }],
+        };
+        let mut buf = Vec::new();
+        render_text(&result, "old.csv", "new.csv", &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("modified"));
+        assert!(output.contains("age"));
+        assert!(output.contains("city"));
+        assert!(output.contains("\"30\" -> \"31\""));
+        assert!(output.contains("\"NYC\" -> \"Boston\""));
+    }
+
+    #[test]
+    fn test_render_summary_csv_field_changes() {
+        let result = DiffResult {
+            identical: false,
+            entries: vec![
+                DiffEntry {
+                    path: "[1]".to_string(),
+                    kind: DiffKind::Removed,
+                    old_value: Some("Alice, 30, NYC".to_string()),
+                    new_value: None,
+                    old_key: None,
+                    new_key: None,
+                    field_changes: None,
+                    row_key: Some("1".to_string()),
+                    row_index_old: Some(0),
+                    row_index_new: None,
+                },
+                DiffEntry {
+                    path: "[2]".to_string(),
+                    kind: DiffKind::Changed,
+                    old_value: Some("Bob, 25, SF".to_string()),
+                    new_value: Some("Bob, 26, LA".to_string()),
+                    old_key: None,
+                    new_key: None,
+                    field_changes: Some(vec![
+                        FieldChange {
+                            column: "age".to_string(),
+                            old_value: "25".to_string(),
+                            new_value: "26".to_string(),
+                        },
+                        FieldChange {
+                            column: "city".to_string(),
+                            old_value: "SF".to_string(),
+                            new_value: "LA".to_string(),
+                        },
+                    ]),
+                    row_key: Some("2".to_string()),
+                    row_index_old: Some(1),
+                    row_index_new: Some(1),
+                },
+                DiffEntry {
+                    path: "[3]".to_string(),
+                    kind: DiffKind::Added,
+                    old_value: None,
+                    new_value: Some("Charlie, 28, CHI".to_string()),
+                    old_key: None,
+                    new_key: None,
+                    field_changes: None,
+                    row_key: Some("3".to_string()),
+                    row_index_old: None,
+                    row_index_new: Some(2),
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        render_summary(&result, "old.csv", "new.csv", &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("Removed"));
+        assert!(output.contains("Added"));
+        assert!(output.contains("Modified"));
+        assert!(output.contains("[1]"));
+        assert!(output.contains("[2]"));
+        assert!(output.contains("[3]"));
+        assert!(output.contains("age"));
+        assert!(output.contains("city"));
+        assert!(output.contains("\"SF\" → \"LA\""));
+    }
+
+    #[test]
+    fn test_render_json_csv_field_changes() {
+        let result = DiffResult {
+            identical: false,
+            entries: vec![DiffEntry {
+                path: "[1]".to_string(),
+                kind: DiffKind::Changed,
+                old_value: Some("Alice, 30, NYC".to_string()),
+                new_value: Some("Alice, 31, Boston".to_string()),
+                old_key: None,
+                new_key: None,
+                field_changes: Some(vec![FieldChange {
+                    column: "age".to_string(),
+                    old_value: "30".to_string(),
+                    new_value: "31".to_string(),
+                }]),
+                row_key: Some("1".to_string()),
+                row_index_old: Some(0),
+                row_index_new: Some(0),
+            }],
+        };
+        let mut buf = Vec::new();
+        render_json(&result, "old.csv", "new.csv", &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let entry = &parsed["entries"][0];
+        assert_eq!(entry["row_key"], "1");
+        assert_eq!(entry["row_index_old"], 0);
+        assert_eq!(entry["row_index_new"], 0);
+        assert_eq!(entry["field_changes"].as_array().unwrap().len(), 1);
+        assert_eq!(entry["field_changes"][0]["column"], "age");
     }
 }

@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::diff::{diff_values_with_config, DiffConfig};
+use crate::diff::{csv_diff_keyed, diff_values_with_config, DiffConfig};
 use crate::format::{parse_content, Format};
 use crate::output::{render_diff, OutputFormat};
 use crate::schema::{infer_schema, render_json_tree, render_text, to_json_schema};
@@ -36,8 +36,8 @@ enum Commands {
         /// Second file (new)
         file2: String,
 
-        /// Output format: text (default) or json
-        #[arg(long, short = 'f', default_value = "text", value_parser = ["text", "json"])]
+        /// Output format: text (default), json, or summary
+        #[arg(long, short = 'f', default_value = "text", value_parser = ["text", "json", "summary"])]
         format: String,
 
         /// Paths to ignore (dot-separated, can be specified multiple times)
@@ -51,6 +51,14 @@ enum Commands {
         /// Disable rename detection (by default, renamed keys are detected)
         #[arg(long = "no-rename")]
         no_rename: bool,
+
+        /// Key column(s) for CSV key-based row matching (can specify multiple)
+        #[arg(long, short = 'k')]
+        key: Vec<String>,
+
+        /// Include unchanged rows in CSV diff output
+        #[arg(long = "include-unchanged")]
+        include_unchanged: bool,
     },
     /// Compare all supported files in two directories
     Dir {
@@ -88,7 +96,18 @@ fn main() {
             ignore,
             r#type,
             no_rename,
-        } => handle_diff(file1, file2, format, ignore, r#type, *no_rename),
+            key,
+            include_unchanged,
+        } => handle_diff(
+            file1,
+            file2,
+            format,
+            ignore,
+            r#type,
+            *no_rename,
+            key,
+            *include_unchanged,
+        ),
         Commands::Dir { dir1, dir2, format } => handle_dir(dir1, dir2, format),
         Commands::Schema {
             file,
@@ -103,6 +122,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_diff(
     file1: &str,
     file2: &str,
@@ -110,9 +130,12 @@ fn handle_diff(
     ignore_paths: &[String],
     force_type: &Option<String>,
     no_rename: bool,
+    key: &[String],
+    include_unchanged: bool,
 ) -> Result<(), String> {
     let output_format = match format_str {
         "json" => OutputFormat::Json,
+        "summary" => OutputFormat::Summary,
         _ => OutputFormat::Text,
     };
 
@@ -163,7 +186,12 @@ fn handle_diff(
         rename_threshold: 0.6,
     };
 
-    let mut result = diff_values_with_config(&val1, &val2, "", &config);
+    // Use CSV key-based diff when format is CSV and key columns are specified
+    let mut result = if fmt == Format::Csv && !key.is_empty() {
+        csv_diff_keyed(&val1, &val2, key, include_unchanged)
+    } else {
+        diff_values_with_config(&val1, &val2, "", &config)
+    };
 
     // Apply ignore filters
     if !ignore_paths.is_empty() {

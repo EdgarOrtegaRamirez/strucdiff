@@ -16,6 +16,22 @@ pub struct DiffEntry {
     pub old_key: Option<String>,
     /// For Renamed entries: the new key name
     pub new_key: Option<String>,
+    /// For CSV row diffs: field-level changes (column, old_value, new_value)
+    pub field_changes: Option<Vec<FieldChange>>,
+    /// For CSV row diffs: the composite key value
+    pub row_key: Option<String>,
+    /// For CSV row diffs: old row index (0-based)
+    pub row_index_old: Option<usize>,
+    /// For CSV row diffs: new row index (0-based)
+    pub row_index_new: Option<usize>,
+}
+
+/// A field-level change within a CSV row
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldChange {
+    pub column: String,
+    pub old_value: String,
+    pub new_value: String,
 }
 
 /// The kind of change at a path
@@ -103,6 +119,10 @@ pub fn diff_values_with_config(
                     new_value: Some(format_value(right)),
                     old_key: None,
                     new_key: None,
+                    field_changes: None,
+                    row_key: None,
+                    row_index_old: None,
+                    row_index_new: None,
                 });
                 result.identical = false;
             }
@@ -157,6 +177,10 @@ fn diff_objects(
             new_value: Some(format_value(&right[new_key])),
             old_key: Some((**old_key).to_string()),
             new_key: Some((**new_key).to_string()),
+            field_changes: None,
+            row_key: None,
+            row_index_old: None,
+            row_index_new: None,
         });
         result.identical = false;
 
@@ -201,6 +225,10 @@ fn diff_objects(
             new_value: None,
             old_key: None,
             new_key: None,
+            field_changes: None,
+            row_key: None,
+            row_index_old: None,
+            row_index_new: None,
         });
         result.identical = false;
     }
@@ -223,6 +251,10 @@ fn diff_objects(
             new_value: Some(format_value(&right[*key])),
             old_key: None,
             new_key: None,
+            field_changes: None,
+            row_key: None,
+            row_index_old: None,
+            row_index_new: None,
         });
         result.identical = false;
     }
@@ -256,6 +288,10 @@ fn diff_arrays(
                     new_value: None,
                     old_key: None,
                     new_key: None,
+                    field_changes: None,
+                    row_key: None,
+                    row_index_old: None,
+                    row_index_new: None,
                 });
                 result.identical = false;
             }
@@ -267,6 +303,10 @@ fn diff_arrays(
                     new_value: Some(format_value(rv)),
                     old_key: None,
                     new_key: None,
+                    field_changes: None,
+                    row_key: None,
+                    row_index_old: None,
+                    row_index_new: None,
                 });
                 result.identical = false;
             }
@@ -351,6 +391,204 @@ fn normalize_key(s: &str) -> String {
     result
 }
 
+/// Compare two CSV data sets using key-based row matching.
+/// Each value should be an array of objects (rows with named columns).
+pub fn csv_diff_keyed(
+    left: &Value,
+    right: &Value,
+    key_columns: &[String],
+    include_unchanged: bool,
+) -> DiffResult {
+    let mut result = DiffResult::new();
+
+    let left_rows = match left.as_array() {
+        Some(arr) => arr,
+        None => return result,
+    };
+    let right_rows = match right.as_array() {
+        Some(arr) => arr,
+        None => return result,
+    };
+
+    // Collect all column names from both datasets
+    let mut all_columns: BTreeSet<String> = BTreeSet::new();
+    for row in left_rows.iter().chain(right_rows.iter()) {
+        if let Some(obj) = row.as_object() {
+            for key in obj.keys() {
+                all_columns.insert(key.clone());
+            }
+        }
+    }
+    let columns: Vec<String> = all_columns.into_iter().collect();
+
+    // Build composite key index for left and right
+    let left_index = build_csv_index(left_rows, key_columns);
+    let right_index = build_csv_index(right_rows, key_columns);
+
+    let left_keys: BTreeSet<&String> = left_index.keys().collect();
+    let right_keys: BTreeSet<&String> = right_index.keys().collect();
+
+    // Removed rows (in left but not in right)
+    for key in left_keys.difference(&right_keys) {
+        let (row, idx) = &left_index[*key];
+        let key_val = key.trim_start_matches('\0');
+        result.entries.push(DiffEntry {
+            path: format!("[{}]", key_val),
+            kind: DiffKind::Removed,
+            old_value: Some(format_row(row, &columns)),
+            new_value: None,
+            old_key: None,
+            new_key: None,
+            field_changes: None,
+            row_key: Some(key_val.to_string()),
+            row_index_old: Some(*idx),
+            row_index_new: None,
+        });
+        result.identical = false;
+    }
+
+    // Added rows (in right but not in left)
+    for key in right_keys.difference(&left_keys) {
+        let (row, idx) = &right_index[*key];
+        let key_val = key.trim_start_matches('\0');
+        result.entries.push(DiffEntry {
+            path: format!("[{}]", key_val),
+            kind: DiffKind::Added,
+            old_value: None,
+            new_value: Some(format_row(row, &columns)),
+            old_key: None,
+            new_key: None,
+            field_changes: None,
+            row_key: Some(key_val.to_string()),
+            row_index_old: None,
+            row_index_new: Some(*idx),
+        });
+        result.identical = false;
+    }
+
+    // Matched rows (in both)
+    for key in left_keys.intersection(&right_keys) {
+        let (left_row, left_idx) = &left_index[*key];
+        let (right_row, right_idx) = &right_index[*key];
+        let key_val = key.trim_start_matches('\0');
+
+        let field_diffs = compare_csv_rows(left_row, right_row, &columns);
+
+        if !field_diffs.is_empty() {
+            result.entries.push(DiffEntry {
+                path: format!("[{}]", key_val),
+                kind: DiffKind::Changed,
+                old_value: Some(format_row(left_row, &columns)),
+                new_value: Some(format_row(right_row, &columns)),
+                old_key: None,
+                new_key: None,
+                field_changes: Some(field_diffs),
+                row_key: Some(key_val.to_string()),
+                row_index_old: Some(*left_idx),
+                row_index_new: Some(*right_idx),
+            });
+            result.identical = false;
+        } else if include_unchanged {
+            result.entries.push(DiffEntry {
+                path: format!("[{}]", key_val),
+                kind: DiffKind::Added, // re-use as "unchanged" marker in output
+                old_value: Some(format_row(left_row, &columns)),
+                new_value: Some(format_row(right_row, &columns)),
+                old_key: None,
+                new_key: None,
+                field_changes: None,
+                row_key: Some(key_val.to_string()),
+                row_index_old: Some(*left_idx),
+                row_index_new: Some(*right_idx),
+            });
+        }
+    }
+
+    result
+}
+
+/// Build a composite key index from CSV rows (array of objects).
+/// Returns a map: composite_key_string -> (row_value, row_index)
+fn build_csv_index<'a>(
+    rows: &'a [Value],
+    key_columns: &[String],
+) -> BTreeMap<String, (&'a Value, usize)> {
+    let mut index: BTreeMap<String, (&'a Value, usize)> = BTreeMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(obj) = row.as_object() {
+            let mut parts: Vec<String> = Vec::new();
+            for kc in key_columns {
+                let val = obj.get(kc).map(value_to_string).unwrap_or_default();
+                parts.push(val);
+            }
+            let mut key = parts.join("\t");
+            // Handle duplicate keys
+            if index.contains_key(&key) {
+                let mut suffix = 1;
+                let mut dedup_key = format!("\0{}.{}", key, suffix);
+                while index.contains_key(&dedup_key) {
+                    suffix += 1;
+                    dedup_key = format!("\0{}.{}", key, suffix);
+                }
+                key = dedup_key;
+            }
+            index.insert(key, (row, i));
+        }
+    }
+    index
+}
+
+/// Compare two CSV rows field by field and return field-level changes.
+fn compare_csv_rows(left: &Value, right: &Value, columns: &[String]) -> Vec<FieldChange> {
+    let mut changes = Vec::new();
+    let left_obj = left.as_object();
+    let right_obj = right.as_object();
+
+    for col in columns {
+        let lv = left_obj
+            .and_then(|m| m.get(col))
+            .map(value_to_string)
+            .unwrap_or_default();
+        let rv = right_obj
+            .and_then(|m| m.get(col))
+            .map(value_to_string)
+            .unwrap_or_default();
+        if lv != rv {
+            changes.push(FieldChange {
+                column: col.clone(),
+                old_value: lv,
+                new_value: rv,
+            });
+        }
+    }
+    changes
+}
+
+/// Format a CSV row (object) as a string representation
+fn format_row(row: &Value, columns: &[String]) -> String {
+    match row.as_object() {
+        Some(obj) => {
+            let parts: Vec<String> = columns
+                .iter()
+                .map(|c| obj.get(c).map(value_to_string).unwrap_or_default())
+                .collect();
+            parts.join(", ")
+        }
+        None => format_value(row),
+    }
+}
+
+/// Convert a Value to a plain string for CSV comparison
+fn value_to_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Array(_) => format_value(v),
+        Value::Object(_) => format_value(v),
+    }
+}
 /// Compute Levenshtein edit distance between two strings
 fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
@@ -647,6 +885,185 @@ mod tests {
             .collect();
         assert_eq!(renames.len(), 1);
         assert_eq!(renames[0].path, "config.database_host");
+    }
+
+    // ===== CSV key-based diff tests =====
+
+    #[test]
+    fn test_csv_diff_keyed_identical() {
+        let left: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": 30},
+            {"id": "2", "name": "Bob", "age": 25},
+        ]);
+        let keys = vec!["id".to_string()];
+        let result = csv_diff_keyed(&left, &left, &keys, false);
+        assert!(result.identical);
+        assert!(result.entries.is_empty());
+    }
+
+    #[test]
+    fn test_csv_diff_keyed_added_row() {
+        let left: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": 30},
+        ]);
+        let right: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": 30},
+            {"id": "2", "name": "Bob", "age": 25},
+        ]);
+        let keys = vec!["id".to_string()];
+        let result = csv_diff_keyed(&left, &right, &keys, false);
+        assert!(!result.identical);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, DiffKind::Added);
+        assert_eq!(result.entries[0].row_key.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_csv_diff_keyed_removed_row() {
+        let left: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": 30},
+            {"id": "2", "name": "Bob", "age": 25},
+        ]);
+        let right: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": 30},
+        ]);
+        let keys = vec!["id".to_string()];
+        let result = csv_diff_keyed(&left, &right, &keys, false);
+        assert!(!result.identical);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, DiffKind::Removed);
+        assert_eq!(result.entries[0].row_key.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_csv_diff_keyed_modified_row() {
+        let left: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": "30"},
+        ]);
+        let right: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": "31"},
+        ]);
+        let keys = vec!["id".to_string()];
+        let result = csv_diff_keyed(&left, &right, &keys, false);
+        assert!(!result.identical);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, DiffKind::Changed);
+        let changes = result.entries[0].field_changes.as_ref().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].column, "age");
+        assert_eq!(changes[0].old_value, "30");
+        assert_eq!(changes[0].new_value, "31");
+    }
+
+    #[test]
+    fn test_csv_diff_keyed_include_unchanged() {
+        let left: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": 30},
+        ]);
+        let right: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "age": 30},
+        ]);
+        let keys = vec!["id".to_string()];
+        let result = csv_diff_keyed(&left, &right, &keys, true);
+        assert!(result.identical);
+        assert_eq!(result.entries.len(), 1); // unchanged entries included
+    }
+
+    #[test]
+    fn test_csv_diff_keyed_mixed_changes() {
+        let left: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "city": "NYC"},
+            {"id": "2", "name": "Bob", "city": "SF"},
+            {"id": "3", "name": "Charlie", "city": "LA"},
+        ]);
+        let right: Value = serde_json::json!([
+            {"id": "1", "name": "Alice", "city": "Boston"},  // modified
+            {"id": "2", "name": "Bob", "city": "SF"},        // unchanged
+            {"id": "4", "name": "Diana", "city": "CHI"},     // added
+        ]);
+        let keys = vec!["id".to_string()];
+        let result = csv_diff_keyed(&left, &right, &keys, false);
+        assert!(!result.identical);
+        // Should have: 1 removed (id:3), 1 added (id:4), 1 modified (id:1)
+        assert_eq!(result.entries.len(), 3);
+
+        let removed: Vec<_> = result
+            .entries
+            .iter()
+            .filter(|e| e.kind == DiffKind::Removed)
+            .collect();
+        let added: Vec<_> = result
+            .entries
+            .iter()
+            .filter(|e| e.kind == DiffKind::Added)
+            .collect();
+        let changed: Vec<_> = result
+            .entries
+            .iter()
+            .filter(|e| e.kind == DiffKind::Changed)
+            .collect();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].row_key.as_deref(), Some("3"));
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].row_key.as_deref(), Some("4"));
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].row_key.as_deref(), Some("1"));
+        assert_eq!(changed[0].field_changes.as_ref().unwrap()[0].column, "city");
+    }
+
+    #[test]
+    fn test_csv_diff_keyed_composite_key() {
+        let left: Value = serde_json::json!([
+            {"first": "Alice", "last": "Smith", "age": 30},
+        ]);
+        let right: Value = serde_json::json!([
+            {"first": "Alice", "last": "Smith", "age": 31},
+        ]);
+        let keys = vec!["first".to_string(), "last".to_string()];
+        let result = csv_diff_keyed(&left, &right, &keys, false);
+        assert!(!result.identical);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].kind, DiffKind::Changed);
+    }
+
+    #[test]
+    fn test_csv_diff_keyed_duplicate_keys() {
+        let left: Value = serde_json::json!([
+            {"id": "1", "val": "a"},
+            {"id": "1", "val": "b"},
+        ]);
+        let right: Value = serde_json::json!([
+            {"id": "1", "val": "a"},
+            {"id": "1", "val": "b"},
+        ]);
+        let keys = vec!["id".to_string()];
+        let result = csv_diff_keyed(&left, &right, &keys, false);
+        assert!(result.identical);
+    }
+
+    #[test]
+    fn test_build_csv_index() {
+        let rows: Value = serde_json::json!([
+            {"id": "1", "name": "Alice"},
+            {"id": "2", "name": "Bob"},
+        ]);
+        let rows_arr = rows.as_array().unwrap();
+        let index = build_csv_index(rows_arr, &["id".to_string()]);
+        assert_eq!(index.len(), 2);
+        assert!(index.contains_key("1"));
+        assert!(index.contains_key("2"));
+    }
+
+    #[test]
+    fn test_compare_csv_rows() {
+        let left: Value = serde_json::json!({"name": "Alice", "age": "30"});
+        let right: Value = serde_json::json!({"name": "Alice", "age": "31"});
+        let columns = vec!["name".to_string(), "age".to_string()];
+        let changes = compare_csv_rows(&left, &right, &columns);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].column, "age");
+        assert_eq!(changes[0].old_value, "30");
+        assert_eq!(changes[0].new_value, "31");
     }
 
     // ===== Levenshtein and key similarity tests =====
