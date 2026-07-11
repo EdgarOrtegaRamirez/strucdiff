@@ -1,4 +1,4 @@
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 /// A node in an inferred schema tree
@@ -225,6 +225,7 @@ pub fn render_json_tree(node: &SchemaNode) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_infer_null() {

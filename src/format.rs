@@ -60,6 +60,7 @@ pub enum ParseError {
     Yaml(String),
     Toml(String),
     Csv(String),
+    #[allow(dead_code)]
     UnsupportedFormat(String),
 }
 
