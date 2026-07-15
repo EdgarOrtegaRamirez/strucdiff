@@ -468,10 +468,10 @@ mod tests {
 
     #[test]
     fn test_file_strip_protocol() {
-        let result = read_file("file:///tmp/test.json");
-        // Should try to read /tmp/test.json, not find it
+        // Test that file:// protocol is stripped
+        let result = read_file("file:///nonexistent/path.json");
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("/tmp/test.json"));
+        assert!(err.contains("/nonexistent/path.json"));
     }
 }
